@@ -41,7 +41,7 @@ Documentação: [Olinda — Open Data do Banco Central](https://olinda.bcb.gov.b
 
 ### Endpoint
 
-`CotacaoMoedaPeriodo`
+`CotacaoMoedaPeriodo` (parâmetros: `moeda`, `dataInicial`, `dataFinalCotacao`)
 
 O endpoint disponibiliza as cotações de compra e venda por moeda e período, contemplando os boletins publicados durante o dia:
 
@@ -52,7 +52,11 @@ O endpoint disponibiliza as cotações de compra e venda por moeda e período, c
 |Fechamento|1|
 |**Total**|**5 por dia útil**|
 
-A exploração da fonte confirmou que o endpoint `CotacaoMoedaPeriodo` possui granularidade superior aos endpoints `CotacaoDolarDia` e `CotacaoDolarPeriodo`, que representam a cotação PTAX de fechamento.
+A exploração da fonte confirmou que o endpoint `CotacaoMoedaPeriodo` possui granularidade superior aos endpoints `CotacaoDolarDia`, `CotacaoDolarPeriodo` e "Boletim por data" (descartados por redundância — representam apenas a cotação PTAX de fechamento, já contida no endpoint escolhido).
+
+### Escopo de moedas
+
+Todas as **10 moedas** disponíveis no endpoint `Moedas` (AUD, CAD, CHF, DKK, EUR, GBP, JPY, NOK, SEK, USD). Volume estimado: ~50 linhas/dia útil. O endpoint `Moedas` (catálogo com símbolo/nome/tipo) é candidato a uma tabela de referência futura — não implementada ainda.
 
 ### Características da fonte
 
@@ -62,7 +66,7 @@ A exploração da fonte confirmou que o endpoint `CotacaoMoedaPeriodo` possui gr
     
 - Formato estruturado
     
-- Atualização em dias úteis
+- Atualização apenas em dias úteis (confirmado empiricamente — sem publicação em fim de semana/feriado)
     
 - Dados intradiários
     
@@ -103,22 +107,34 @@ A exploração da fonte confirmou que o endpoint `CotacaoMoedaPeriodo` possui gr
                     └──────────────────────┘
 ```
 
+Camada **Gold**: ainda não decidida (fica para quando fizer sentido).
+
 ### Bronze
 
 Camada responsável pela ingestão dos dados diretamente da API.
 
 Características:
 
-- Preserva os dados retornados pela fonte
+- Preserva os dados retornados pela fonte, sem transformação nem validação de tipo (100% crua)
     
 - Utiliza estratégia de `append`
     
-- Mantém informações relacionadas à captura
-    
-- Não aplica regras de negócio
+- Grava o dado mesmo quando a captura vem incompleta (moeda com menos de 5 boletins, ou moeda que falhou na chamada) — serve como evidência para manutenção/análise
     
 - Armazena os dados em Delta Lake
     
+
+**Colunas:** `run_id` (UUID, identifica a execução inteira do pipeline), `moeda`, `paridadeCompra`, `paridadeVenda`, `cotacaoCompra`, `cotacaoVenda`, `dataHoraCotacao`, `tipoBoletim`, `insert_dt` (timestamp de captura)
+
+**Fluxo de ingestão:**
+
+1. Gera `run_id`
+2. Faz um request por moeda (10 chamadas)
+3. Confere sucesso/falha por moeda
+4. Monta um agregado por moeda com a situação (sucesso/falha) — não persistido, usado apenas para decidir o disparo de alerta
+5. Insere os dados que vieram (mesmo que parcial) na Bronze
+
+Não há tabela de log de execução persistida — decisão explícita, por não se justificar no estágio atual do projeto (revisitar se o projeto crescer, ex. dashboard de saúde do pipeline). O histórico de execuções fica a cargo do próprio Databricks Jobs.
 
 ### Silver
 
@@ -126,22 +142,18 @@ Camada responsável pelo tratamento e disponibilização dos dados para consumo 
 
 Principais responsabilidades:
 
-- Validação estrutural
+- Validação estrutural e de tipo dos campos (não feita na Bronze)
     
 - Deduplicação
-    
-- Tratamento dos dados
     
 - Controle de unicidade
     
 - Operações de `upsert`
     
 
-A estratégia definitiva de chave de unicidade está em definição devido à granularidade específica dos boletins da API.
-
 ---
 
-## Desafio de unicidade e deduplicação
+## Desafio de unicidade e deduplicação (resolvido)
 
 Durante a exploração da API foi identificado um comportamento relevante para o desenho da camada Silver.
 
@@ -153,11 +165,32 @@ Por isso, uma chave composta apenas por:
 data + moeda + tipoBoletim
 ```
 
-não representa unicamente cada cotação.
+não representa unicamente cada cotação. Uma operação de `MERGE` baseada nessa chave poderia substituir registros válidos sem gerar necessariamente um erro explícito, resultando em perda silenciosa de dados.
 
-Uma operação de `MERGE` baseada nessa chave poderia substituir registros válidos sem gerar necessariamente um erro explícito, resultando em perda silenciosa de dados.
+**Decisão adotada:** gerar um número sequencial na transformação (ordenando por `dataHoraCotacao` dentro de cada data+moeda) e usar `(data + moeda + tipoBoletim + sequência)` como chave de unicidade na Silver.
 
-A estratégia de unicidade está sendo avaliada com base nos campos de data/hora disponibilizados pela própria fonte.
+---
+
+## Watermark e detecção de gaps
+
+Mecanismo de definição de qual período buscar a cada execução, cobrindo tanto **dias inteiros perdidos** (ex.: job não rodou) quanto **moedas parcialmente perdidas dentro de um dia com execução parcial**.
+
+1. Consulta a própria Bronze dos últimos 30 dias, agrupando por (data, moeda) e contando `COUNT(DISTINCT dataHoraCotacao)`
+2. Qualquer combinação com menos de 5 entra numa lista de pendências a reprocessar
+3. A busca da execução atual = pendências + próximo dia após o último dia completo
+
+`dataHoraCotacao` é o campo usado na contagem (em vez de `COUNT(*)` ou `COUNT(DISTINCT tipoBoletim)`) porque: é um carimbo de publicação vindo da fonte, então mantém os 3 boletins "Intermediário" como valores distintos, e ao mesmo tempo absorve naturalmente duplicatas geradas por reprocessamento (mesmo boletim, mesmo `dataHoraCotacao`) — sem precisar de log nem de coluna de flag de reprocesso.
+
+Não há tabela de log de execução, nem coluna explícita marcando reprocessamento — a própria Bronze funciona como fonte de verdade para ambos.
+
+---
+
+## Orquestração e notificação
+
+- Ferramenta de orquestração: **Databricks Jobs** (decisão fechada, sem restrição de custo identificada até o momento)
+- Célula final do notebook lê o agregado de sucesso/falha por moeda (passo 4 da ingestão Bronze)
+- Se houve falha em qualquer moeda, o notebook falha explicitamente (exceção / `dbutils.notebook.exit` com erro), acionando o alerta nativo de falha do Databricks Jobs
+- Não há alerta de conclusão/sucesso — decisão deliberada, por ser um processo agendado sem necessidade de notificar "deu tudo certo"
 
 ---
 
@@ -169,21 +202,24 @@ API PTAX
    ▼
 Extração
    │
-   ├── Paginação
-   ├── Tratamento de erros
-   └── Captura dos dados
+   ├── Watermark / gap-detection (últimos 30 dias na Bronze)
+   ├── 1 request por moeda (10)
+   └── Confere sucesso/falha por moeda
    │
    ▼
 Bronze
    │
-   ├── Dados brutos
+   ├── Dados brutos (mesmo que parciais)
    └── Delta Lake
+   │
+   ▼
+Alerta (se houve falha) — Databricks Jobs
    │
    ▼
 Silver
    │
-   ├── Validação
-   ├── Deduplicação
+   ├── Validação de tipo
+   ├── Sequenciamento + deduplicação
    └── Upsert
    │
    ▼
@@ -203,8 +239,8 @@ Dados tratados
 |Arquitetura|Medallion / Bronze / Silver|
 |Fonte|API PTAX / OData|
 |Versionamento|Git|
-|Orquestração|Em implementação|
-|Testes e monitoramento|Em implementação|
+|Orquestração|Databricks Jobs|
+|Testes e monitoramento|Alerta nativo de falha (Databricks Jobs); sem log de execução persistido|
 
 ---
 
@@ -212,13 +248,13 @@ Dados tratados
 
 A estratégia de qualidade considera, entre outros pontos:
 
-- Validação do schema recebido
+- Validação do schema recebido (camada Silver)
     
 - Controle de registros duplicados
     
-- Validação da granularidade da fonte
+- Validação da granularidade da fonte (5 boletins por dia útil)
     
-- Verificação da quantidade esperada de boletins
+- Verificação da quantidade esperada de boletins via watermark/gap-detection
     
 - Integridade das informações de data e hora
     
@@ -247,16 +283,22 @@ As regras serão incorporadas progressivamente ao pipeline conforme as camadas f
     
 -  Identificar o problema de unicidade para a camada Silver
     
-
-### Em desenvolvimento
-
--  Definir chave definitiva de unicidade
+-  Definir chave definitiva de unicidade (sequencial + data + moeda + tipoBoletim)
     
--  Definir escopo de moedas
+-  Definir escopo de moedas (todas as 10)
     
 -  Estruturar o repositório
     
--  Implementar ingestão Bronze
+-  Desenhar a ingestão Bronze (colunas, fluxo, controle de execução)
+    
+-  Desenhar o mecanismo de watermark / detecção de gaps
+    
+-  Definir estratégia de orquestração e notificação de falhas
+    
+
+### Em desenvolvimento
+
+-  Implementar ingestão Bronze (código)
     
 -  Implementar transformação Silver
     
@@ -268,54 +310,42 @@ As regras serão incorporadas progressivamente ao pipeline conforme as camadas f
     
 -  Implementar testes de qualidade
     
--  Implementar monitoramento
-    
--  Documentar decisões arquiteturais
+-  Documentar decisões arquiteturais (dicionário de dados)
     
 
 ---
 
 ## Próximas etapas
 
-1. Definir a chave de unicidade da camada Silver
-    
-2. Implementar a ingestão incremental na Bronze
-    
-3. Implementar as transformações da Silver
-    
+1. Implementar a função de request por moeda (Bronze)
+2. Implementar o notebook de orquestração da ingestão Bronze (watermark, coleta, alerta)
+3. Implementar as transformações da Silver (sequenciamento, deduplicação, upsert)
 4. Implementar validações de qualidade
-    
-5. Implementar execução recorrente
-    
-6. Adicionar monitoramento e tratamento de falhas
-    
+5. Concluir o dicionário de dados
+6. Avaliar a necessidade da tabela de catálogo de moedas
 7. Avaliar a necessidade de uma camada Gold
-    
 
 ---
 
-## Estrutura prevista
+## Estrutura do repositório
 
 ```text
-cambio-radar/
-│
-├── notebooks/
-│   ├── bronze/
-│   └── silver/
-│
-├── src/
-│   ├── ingestion/
-│   ├── transformation/
-│   └── validation/
-│
-├── tests/
-│
-├── docs/
-│
-└── README.md
+Cambio_Radar_PTAX/
+├── README.md
+├── Scripts_Notebooks/
+│   ├── Python/          (exploração avulsa, ex.: testes de API)
+│   └── Databricks/
+├── Pipeline/
+│   ├── Bronze/
+│   │   ├── Python/      (funções reutilizáveis, ex.: chamada à API)
+│   │   └── Databricks/  (notebook que orquestra/chama as funções)
+│   └── Silver/
+│       ├── Python/
+│       └── Databricks/
+└── Dicionario_de_Dados/ (em elaboração)
 ```
 
-A estrutura será ajustada conforme a implementação evoluir.
+Camada Gold ainda não criada — decisão pendente.
 
 ---
 
