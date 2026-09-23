@@ -58,6 +58,17 @@ A exploração da fonte confirmou que o endpoint `CotacaoMoedaPeriodo` possui gr
 
 Todas as **10 moedas** disponíveis no endpoint `Moedas` (AUD, CAD, CHF, DKK, EUR, GBP, JPY, NOK, SEK, USD). Volume estimado: ~50 linhas/dia útil. O endpoint `Moedas` (catálogo com símbolo/nome/tipo) é candidato a uma tabela de referência futura — não implementada ainda.
 
+### Catalog e schemas (Unity Catalog)
+
+Criado no Databricks Free Edition:
+
+```text
+cambio_radar (catalog)
+├── bronze (schema)
+│   └── cotacoes_ptax (tabela Delta)
+└── silver (schema)
+```
+
 ### Características da fonte
 
 - Dados públicos
@@ -126,13 +137,15 @@ Características:
 
 **Colunas:** `run_id` (UUID, identifica a execução inteira do pipeline), `moeda`, `paridadeCompra`, `paridadeVenda`, `cotacaoCompra`, `cotacaoVenda`, `dataHoraCotacao`, `tipoBoletim`, `insert_dt` (timestamp de captura)
 
-**Fluxo de ingestão:**
+**Fluxo de ingestão (implementado):**
 
-1. Gera `run_id`
-2. Faz um request por moeda (10 chamadas)
-3. Confere sucesso/falha por moeda
-4. Monta um agregado por moeda com a situação (sucesso/falha) — não persistido, usado apenas para decidir o disparo de alerta
-5. Insere os dados que vieram (mesmo que parcial) na Bronze
+1. Gera `run_id` (UUID) e `insert_dt` (timestamp de captura), antes de qualquer request
+2. Gap-detection: consulta a Bronze dos últimos 30 dias por (moeda, data), contando `COUNT(DISTINCT dataHoraCotacao)`
+3. Monta `pares_pendentes`: um único intervalo `(moeda, data_inicial, hoje)` por moeda — `data_inicial` é a primeira data incompleta encontrada (cobre gaps internos) ou o dia seguinte ao último dia completo; para moeda sem nenhum dado nos últimos 30 dias, assume backfill inicial de 30 dias (padrão ajustável)
+4. Faz um request por par pendente (até 10 chamadas, uma por moeda, cada uma cobrindo o intervalo necessário)
+5. Confere sucesso/falha por moeda; enriquece cada boletim retornado com `moeda`, `run_id`, `insert_dt`
+6. Insere os dados que vieram (mesmo que parcial) na Bronze via `append` em Delta — com proteção para o caso de todas as chamadas falharem (nada a gravar)
+7. Checa o agregado de sucesso/falha (hoje: `print`; alerta de e-mail real ainda não implementado)
 
 Não há tabela de log de execução persistida — decisão explícita, por não se justificar no estágio atual do projeto (revisitar se o projeto crescer, ex. dashboard de saúde do pipeline). O histórico de execuções fica a cargo do próprio Databricks Jobs.
 
@@ -183,14 +196,17 @@ Mecanismo de definição de qual período buscar a cada execução, cobrindo tan
 
 Não há tabela de log de execução, nem coluna explícita marcando reprocessamento — a própria Bronze funciona como fonte de verdade para ambos.
 
+**Implementação real:** em vez de um par `(moeda, data)` por data faltante, o mecanismo gera **um único intervalo por moeda** (aproveitando que o endpoint aceita período) — uma moeda com gap num dia específico e que também precisa buscar hoje recebe uma única chamada cobrindo o intervalo inteiro. Reprocessar dias já completos dentro desse intervalo é inofensivo, pois `dataHoraCotacao` absorve a duplicata.
+
 ---
 
 ## Orquestração e notificação
 
 - Ferramenta de orquestração: **Databricks Jobs** (decisão fechada, sem restrição de custo identificada até o momento)
-- Célula final do notebook lê o agregado de sucesso/falha por moeda (passo 4 da ingestão Bronze)
-- Se houve falha em qualquer moeda, o notebook falha explicitamente (exceção / `dbutils.notebook.exit` com erro), acionando o alerta nativo de falha do Databricks Jobs
+- Célula final do notebook lê o agregado de sucesso/falha por moeda
+- Planejado: se houve falha em qualquer moeda, o notebook falha explicitamente (exceção / `dbutils.notebook.exit` com erro), acionando o alerta nativo de falha do Databricks Jobs — **ainda não implementado**, hoje a checagem só imprime o resultado
 - Não há alerta de conclusão/sucesso — decisão deliberada, por ser um processo agendado sem necessidade de notificar "deu tudo certo"
+- Agendamento do job no Databricks Jobs também ainda não configurado — notebook roda manualmente até o momento
 
 ---
 
@@ -295,18 +311,18 @@ As regras serão incorporadas progressivamente ao pipeline conforme as camadas f
     
 -  Definir estratégia de orquestração e notificação de falhas
     
+-  Criar catalog e schemas no Unity Catalog (`cambio_radar.bronze`, `cambio_radar.silver`)
+    
+-  Implementar e validar a ingestão Bronze ponta a ponta (request por moeda, gap-detection, backfill automático, escrita Delta) — primeira execução completa das 10 moedas gravou 1050 linhas com sucesso
+    
 
 ### Em desenvolvimento
 
--  Implementar ingestão Bronze (código)
+-  Implementar alerta de falha real (e-mail via Databricks Jobs)
     
--  Implementar transformação Silver
+-  Configurar agendamento do job no Databricks Jobs
     
--  Implementar deduplicação
-    
--  Implementar upsert
-    
--  Implementar orquestração
+-  Implementar transformação Silver (sequenciamento, deduplicação, upsert)
     
 -  Implementar testes de qualidade
     
@@ -317,8 +333,8 @@ As regras serão incorporadas progressivamente ao pipeline conforme as camadas f
 
 ## Próximas etapas
 
-1. Implementar a função de request por moeda (Bronze)
-2. Implementar o notebook de orquestração da ingestão Bronze (watermark, coleta, alerta)
+1. Implementar o alerta de falha real (e-mail) e o disparo explícito de falha da task
+2. Configurar o agendamento do job no Databricks Jobs
 3. Implementar as transformações da Silver (sequenciamento, deduplicação, upsert)
 4. Implementar validações de qualidade
 5. Concluir o dicionário de dados
