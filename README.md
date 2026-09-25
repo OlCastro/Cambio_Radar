@@ -118,7 +118,7 @@ cambio_radar (catalog)
                     └──────────────────────┘
 ```
 
-Camada **Gold**: ainda não decidida (fica para quando fizer sentido).
+Camada **Gold**: ainda não decidida.
 
 ### Bronze
 
@@ -145,7 +145,7 @@ Características:
 4. Faz um request por par pendente (até 10 chamadas, uma por moeda, cada uma cobrindo o intervalo necessário)
 5. Confere sucesso/falha por moeda; enriquece cada boletim retornado com `moeda`, `run_id`, `insert_dt`
 6. Insere os dados que vieram (mesmo que parcial) na Bronze via `append` em Delta — com proteção para o caso de todas as chamadas falharem (nada a gravar)
-7. Checa o agregado de sucesso/falha (hoje: `print`; alerta de e-mail real ainda não implementado)
+7. Checa o agregado de sucesso/falha — se houver falha, dispara `raise Exception`, fazendo a task falhar e acionar o alerta nativo do Databricks Jobs
 
 Não há tabela de log de execução persistida — decisão explícita, por não se justificar no estágio atual do projeto (revisitar se o projeto crescer, ex. dashboard de saúde do pipeline). O histórico de execuções fica a cargo do próprio Databricks Jobs.
 
@@ -162,6 +162,20 @@ Principais responsabilidades:
 - Controle de unicidade
     
 - Operações de `upsert`
+    
+
+**Schema (`cambio_radar.silver.cotacoes_ptax`):** `moeda`, `dataHoraCotacao` (TIMESTAMP), `tipoBoletim`, `sequencia_intermediario` (INT, só preenchido para boletins Intermediário), `cotacaoCompra`, `cotacaoVenda`, `paridadeCompra`, `paridadeVenda`, `run_id`, `insert_dt` (TIMESTAMP)
+
+**Fluxo de transformação (implementado):**
+
+1. Consulta `MAX(insert_dt)` já processado na própria Silver (sem tabela de log — mesmo princípio da Bronze)
+2. Lê da Bronze apenas o que tem `insert_dt` maior que o último processado (watermark por momento de processamento, não por data de negócio — evita o mesmo problema que motivou o watermark da Bronze, já que um reprocessamento pode gravar uma data de negócio antiga)
+3. Aplica `to_timestamp()` nas colunas `dataHoraCotacao` e `insert_dt` (gravadas como STRING na Bronze, confirmado via `DESCRIBE`)
+4. Checagem de qualidade: se algum `dataHoraCotacao` ficou `NULL` após o cast (indício de mudança no formato da fonte), dispara `raise Exception` — `to_timestamp()` não gera erro sozinho para formato não reconhecido, só retorna nulo silenciosamente
+5. Calcula `sequencia_intermediario` via `ROW_NUMBER()` particionado por (moeda, data) e ordenado por `dataHoraCotacao`, aplicado somente às linhas com `tipoBoletim = 'Intermediário'`
+6. Grava via `MERGE INTO ... WHEN NOT MATCHED THEN INSERT`, usando `(moeda + dataHoraCotacao)` como chave — esse par já é suficiente para unicidade (o timestamp completo, com hora, já distingue os 3 boletins Intermediário); a sequência fica só como coluna analítica, fora da chave de unicidade
+
+Não há checagem equivalente de nulo para `insert_dt` — decisão deliberada, já que é um campo gerado internamente (não vem da fonte), sem risco de mudança de formato externo.
     
 
 ---
@@ -181,6 +195,8 @@ data + moeda + tipoBoletim
 não representa unicamente cada cotação. Uma operação de `MERGE` baseada nessa chave poderia substituir registros válidos sem gerar necessariamente um erro explícito, resultando em perda silenciosa de dados.
 
 **Decisão adotada:** gerar um número sequencial na transformação (ordenando por `dataHoraCotacao` dentro de cada data+moeda) e usar `(data + moeda + tipoBoletim + sequência)` como chave de unicidade na Silver.
+
+**Nota sobre a implementação real:** ao construir a Silver, ficou claro que `dataHoraCotacao` completo (com hora) já é único por boletim, incluindo os 3 Intermediários. Por isso, a chave usada no `MERGE` acabou sendo `(moeda + dataHoraCotacao)`, mais simples — a sequência permanece útil como coluna analítica (filtrar "todos os 2º Intermediários", por exemplo), mas não é mais necessária para garantir unicidade.
 
 ---
 
@@ -203,10 +219,15 @@ Não há tabela de log de execução, nem coluna explícita marcando reprocessam
 ## Orquestração e notificação
 
 - Ferramenta de orquestração: **Databricks Jobs** (decisão fechada, sem restrição de custo identificada até o momento)
-- Célula final do notebook lê o agregado de sucesso/falha por moeda
-- Planejado: se houve falha em qualquer moeda, o notebook falha explicitamente (exceção / `dbutils.notebook.exit` com erro), acionando o alerta nativo de falha do Databricks Jobs — **ainda não implementado**, hoje a checagem só imprime o resultado
-- Não há alerta de conclusão/sucesso — decisão deliberada, por ser um processo agendado sem necessidade de notificar "deu tudo certo"
-- Agendamento do job no Databricks Jobs também ainda não configurado — notebook roda manualmente até o momento
+- Célula final do notebook lê o agregado de sucesso/falha por moeda; se houver falha, executa `raise Exception`, fazendo a task falhar explicitamente
+- Job criado no Databricks Jobs com task do tipo Notebook (Source = Workspace — o job sempre executa a versão mais recente salva no notebook, sem necessidade de reconfiguração a cada edição)
+- Agendamento diário configurado; execução manual ("Run now") também disponível a qualquer momento, sem configuração adicional
+- Notificação por e-mail configurada para falha (`on failure`); não há alerta de conclusão/sucesso — decisão deliberada, por ser um processo agendado sem necessidade de notificar "deu tudo certo"
+- **Validado com teste real:** falha forçada via timeout gerou exceção, marcou a task como Failed e disparou o e-mail de alerta corretamente. Teste com código de moeda inválido (`XXX`) não gera falha — a API responde HTTP 200 com lista vazia para moeda inexistente, em vez de erro; comportamento aceito como não sendo um risco real, já que a lista de moedas usada pelo pipeline é fixa e validada
+
+**Dependência Bronze → Silver:** as duas camadas vivem no mesmo Job (não existe trigger nativo entre Jobs totalmente separados no Databricks sem código customizado). A task da Silver tem "Depends on" apontando para a task da Bronze, com condição "All succeeded" — a Silver só executa se a Bronze terminar com sucesso, evitando processar sobre uma Bronze desatualizada ou incompleta. Testado com execução real do Job completo: as duas tasks concluíram com sucesso em sequência.
+
+**Nota sobre alternativas avaliadas:** o Lakeflow Declarative Pipelines (antigo Delta Live Tables) resolveria boa parte dessa lógica de forma declarativa (incremental automático, dependências inferidas, sem necessidade de watermark manual). Decisão foi terminar a versão manual primeiro, já que o objetivo do projeto é validar autonomia de arquitetura from scratch — migrar para lá é considerado como possível exercício comparativo futuro.
 
 ---
 
@@ -231,12 +252,13 @@ Bronze
    ▼
 Alerta (se houve falha) — Databricks Jobs
    │
-   ▼
+   ▼  (task dependency: "All succeeded")
 Silver
    │
-   ├── Validação de tipo
-   ├── Sequenciamento + deduplicação
-   └── Upsert
+   ├── Watermark por insert_dt (o que é novo desde o último processamento)
+   ├── Cast de tipo + checagem de nulo pós-cast
+   ├── Sequenciamento (Intermediário) + MERGE (moeda + dataHoraCotacao)
+   └── Delta Lake
    │
    ▼
 Dados tratados
@@ -256,7 +278,7 @@ Dados tratados
 |Fonte|API PTAX / OData|
 |Versionamento|Git|
 |Orquestração|Databricks Jobs|
-|Testes e monitoramento|Alerta nativo de falha (Databricks Jobs); sem log de execução persistido|
+|Testes e monitoramento|Alerta nativo de falha (Databricks Jobs), validado com teste real de timeout; sem log de execução persistido|
 
 ---
 
@@ -315,15 +337,17 @@ As regras serão incorporadas progressivamente ao pipeline conforme as camadas f
     
 -  Implementar e validar a ingestão Bronze ponta a ponta (request por moeda, gap-detection, backfill automático, escrita Delta) — primeira execução completa das 10 moedas gravou 1050 linhas com sucesso
     
+-  Implementar e validar o alerta de falha real (raise Exception + notificação por e-mail do Databricks Jobs) — testado com falha forçada de timeout, e-mail recebido corretamente
+    
+-  Configurar o agendamento do job no Databricks Jobs (execução diária + Run now disponível)
+    
+-  Implementar e validar a transformação Silver (watermark por insert_dt, cast de tipo, checagem de nulo, sequenciamento, MERGE) — testado com dado real
+    
+-  Configurar dependência Bronze → Silver no mesmo Job ("Depends on", All succeeded) — testado com execução completa, ambas as tasks com sucesso
+    
 
 ### Em desenvolvimento
 
--  Implementar alerta de falha real (e-mail via Databricks Jobs)
-    
--  Configurar agendamento do job no Databricks Jobs
-    
--  Implementar transformação Silver (sequenciamento, deduplicação, upsert)
-    
 -  Implementar testes de qualidade
     
 -  Documentar decisões arquiteturais (dicionário de dados)
@@ -333,13 +357,11 @@ As regras serão incorporadas progressivamente ao pipeline conforme as camadas f
 
 ## Próximas etapas
 
-1. Implementar o alerta de falha real (e-mail) e o disparo explícito de falha da task
-2. Configurar o agendamento do job no Databricks Jobs
-3. Implementar as transformações da Silver (sequenciamento, deduplicação, upsert)
-4. Implementar validações de qualidade
-5. Concluir o dicionário de dados
-6. Avaliar a necessidade da tabela de catálogo de moedas
-7. Avaliar a necessidade de uma camada Gold
+1. Implementar validações de qualidade
+2. Concluir o dicionário de dados
+3. Avaliar a necessidade da tabela de catálogo de moedas
+4. Avaliar a necessidade de uma camada Gold
+5. (Futuro) Reconstruir o pipeline com Lakeflow Declarative Pipelines, como exercício comparativo manual vs. declarativo
 
 ---
 
@@ -364,9 +386,3 @@ Cambio_Radar_PTAX/
 Camada Gold ainda não criada — decisão pendente.
 
 ---
-
-## Projeto relacionado
-
-**AssistBR** — projeto de Data Warehouse dimensional desenvolvido em paralelo, com foco em modelagem dimensional, regras de negócio e arquitetura analítica.
-
-Enquanto o AssistBR explora principalmente modelagem e arquitetura de Data Warehouse, o Câmbio Radar concentra-se no ciclo de vida de um pipeline de dados: **ingestão → processamento → armazenamento → qualidade → orquestração**.
